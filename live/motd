@@ -1,0 +1,5 @@
+
+ghostos installer  (ginit + gboot)
+wifi:   iwctl  ->  station wlan0 connect <ssid>
+install: ghostosinstall
+

@@ -1,0 +1,352 @@
+#!/bin/bash
+
+set -eu
+
+GH=https://github.com/gh0st-8221
+WORK=${WORK:-/tmp/ghostosinstall}
+MNT=${MNT:-/mnt}
+DRY=${DRY:-}
+
+CORE="base linux linux-headers linux-firmware base-devel git sudo wget curl mkinitcpio
+efibootmgr gnu-efi iwd dhcpcd dbus zsh pkgconf libx11 libxext libxrandr libxcomposite
+libxdamage libxrender"
+DROP="grub os-prober networkmanager network-manager-applet openresolv"
+
+die() { printf 'ghostosinstall: %s\n' "$*" >&2; exit 1; }
+say() { printf '\n:: %s\n' "$*"; }
+run() { if [ -n "$DRY" ]; then printf '+ %s\n' "$*"; else "$@"; fi; }
+
+ask() {
+	local d=${2:-}
+	read -r -p "$1${d:+ [$d]}: " REPLY || die "no input"
+	[ -n "$REPLY" ] || REPLY=$d
+}
+askpw() {
+	local a b
+	while :; do
+		read -r -s -p "password for $1: " a; echo
+		read -r -s -p "again: " b; echo
+		[ -n "$a" ] && [ "$a" = "$b" ] && { REPLY=$a; return; }
+		echo "empty or does not match"
+	done
+}
+
+if [ -z "$DRY" ] && [ -e /run/ghostos-live ] && [ ! -e /run/ghostos-ready ]; then
+	say "waiting for the live system (udev, pacman keyring)"
+	while [ ! -e /run/ghostos-ready ]; do sleep 1; done
+fi
+if [ -z "$DRY" ]; then
+	[ "$(id -u)" = 0 ] || die "run as root"
+	[ -d /sys/firmware/efi ] || die "not booted in UEFI mode (gboot is uefi only)"
+	for c in git pacstrap arch-chroot genfstab sgdisk mkfs.fat mkfs.ext4 lsblk blkid awk sed; do
+		command -v "$c" >/dev/null || die "missing tool: $c"
+	done
+	tries=0
+	until curl -fsI --max-time 8 https://github.com >/dev/null 2>&1; do
+		tries=$((tries + 1))
+		if [ "$tries" -ge 8 ]; then
+			echo "no network. wired: dhcpcd <iface>. wifi: iwctl, then 'station wlan0 connect <ssid>'. then run me again."
+			exit 1
+		fi
+		say "waiting for the network ($tries/8)"
+		sleep 4
+	done
+fi
+
+say "fetching the latest dotfiles and package lists"
+mkdir -p "$WORK"
+if [ -n "${DOTS_DIR:-}" ]; then
+	D=$DOTS_DIR
+else
+	D=$WORK/arch-dotfiles
+	rm -rf "$D"
+	git clone -q --depth 1 "$GH/arch-dotfiles.git" "$D" || die "cannot clone arch-dotfiles"
+	echo "arch-dotfiles @ $(git -C "$D" rev-parse --short HEAD)"
+fi
+
+list_native() {
+	if [ -f "$D/packages/native.txt" ]; then cat "$D/packages/native.txt"
+	else sed -n 's/^sudo pacman -Syu --noconfirm //p' "$D/install.sh" | tr ' ' '\n'; fi
+}
+list_foreign() {
+	if [ -f "$D/packages/foreign.txt" ]; then cat "$D/packages/foreign.txt"
+	else sed -n 's/^ *\$HELPER -S --noconfirm //p' "$D/install.sh" | tr ' ' '\n'; fi
+}
+words() { tr ' ' '\n' | sed '/^$/d' | sort -u; }
+
+LIST=$WORK/packages.list
+mk_list() {
+	{
+		echo "# packages to install. one per line, '#' starts a comment. delete a line to skip it."
+		echo "# taken from the system that made the latest backup, so check hardware specific"
+		echo "# ones (nvidia-open, libva-nvidia-driver, intel-ucode, steam...) before installing."
+		echo "# the boot manager (gboot), init (ginit) and network (iwd) are fixed: other ones are left out."
+		echo "# core packages (base linux git sudo base-devel ...) are always added."
+		echo
+		echo "[pacman]"
+		list_native | words | grep -vxF "$(echo $DROP | tr ' ' '\n')" || true
+		echo
+		echo "[aur]"
+		echo "# built with yay. yay itself and xdg-desktop-portal-termfilechooser-git are handled separately."
+		list_foreign | words | grep -vxE 'yay|yay-bin|xdg-desktop-portal-termfilechooser-git' || true
+	} > "$LIST"
+}
+mk_list
+
+section() {
+	sed 's/#.*//' "$LIST" | awk -v want="[$1]" '
+		/^\[/ { cur = $1; next }
+		cur == want { for (i = 1; i <= NF; i++) print $i }' | sort -u
+}
+
+DISK=""
+HOST=ghost
+USER_=ghost
+TZ_=Europe/Kyiv
+ROOTPW=""
+USERPW=""
+
+pick_disk() {
+	say "disks"
+	lsblk -dpno NAME,SIZE,MODEL,TRAN | grep -Ev 'loop|sr[0-9]|zram' || true
+	ask "disk to ERASE and install on (e.g. /dev/nvme0n1)" "$DISK"
+	[ -b "$REPLY" ] || [ -n "$DRY" ] || { echo "$REPLY is not a block device"; return; }
+	if [ -z "$DRY" ] && lsblk -nrpo MOUNTPOINTS "$REPLY" | grep -q /run/archiso; then
+		echo "$REPLY holds the installer, pick another disk"
+		return
+	fi
+	DISK=$REPLY
+}
+edit_pkgs() {
+	"${EDITOR:-nano}" "$LIST" || "${EDITOR:-vi}" "$LIST"
+	echo "pacman: $(section pacman | wc -l) packages, aur: $(section aur | wc -l) packages"
+}
+set_pw() {
+	askpw root; ROOTPW=$REPLY
+	askpw "$USER_"; USERPW=$REPLY
+}
+show() {
+	echo
+	echo "  1) disk        ${DISK:-<not set>}"
+	echo "  2) hostname    $HOST"
+	echo "  3) username    $USER_"
+	echo "  4) passwords   $([ -n "$ROOTPW" ] && echo set || echo '<not set>')"
+	echo "  5) timezone    $TZ_"
+	echo "  6) packages    edit list ($(section pacman | wc -l) pacman, $(section aur | wc -l) aur)"
+	echo "  7) install"
+	echo "  q) quit"
+}
+while :; do
+	show
+	read -r -p "> " c || exit 1
+	case $c in
+	1) pick_disk ;;
+	2) ask hostname "$HOST"; echo "$REPLY" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9-]*$' && HOST=$REPLY || echo "bad hostname" ;;
+	3) ask username "$USER_"; echo "$REPLY" | grep -qE '^[a-z_][a-z0-9_-]*$' && USER_=$REPLY || echo "bad username" ;;
+	4) set_pw ;;
+	5) ask timezone "$TZ_"; [ -e "/usr/share/zoneinfo/$REPLY" ] && TZ_=$REPLY || echo "unknown timezone" ;;
+	6) edit_pkgs ;;
+	7)
+		[ -n "$DISK" ] || { echo "pick a disk first"; continue; }
+		[ -n "$ROOTPW" ] && [ -n "$USERPW" ] || { echo "set the passwords first"; continue; }
+		break ;;
+	q) exit 0 ;;
+	esac
+done
+
+say "enabling multilib and checking the package list"
+enable_multilib() {
+	grep -q '^\[multilib\]' "$1" && return
+	sed -i -e '/^#\[multilib\]/,/^#Include/ s/^#//' "$1"
+}
+run enable_multilib /etc/pacman.conf
+run sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 10/' /etc/pacman.conf
+run pacman -Sy --noconfirm >/dev/null || die "pacman -Sy failed"
+
+PAC=$( { echo $CORE | tr ' ' '\n'; section pacman; } | sort -u)
+bad=""
+if [ -z "$DRY" ]; then
+	have=$( { pacman -Slq; pacman -Sgq; } | sort -u)
+	for p in $(comm -23 <(echo "$PAC") <(echo "$have")); do
+		pacman -Si "$p" >/dev/null 2>&1 || bad="$bad $p"
+	done
+fi
+if [ -n "$bad" ]; then
+	echo "not found in the repos:$bad"
+	read -r -p "drop them and continue? [y/N] " a
+	[ "$a" = y ] || die "fix the list (menu 6) and run again"
+	for p in $bad; do PAC=$(echo "$PAC" | grep -vxF "$p"); done
+fi
+
+echo
+echo "about to ERASE $DISK completely:"
+lsblk -po NAME,SIZE,FSTYPE,LABEL "$DISK" || true
+read -r -p "type the disk path again to confirm: " a
+[ "$a" = "$DISK" ] || die "cancelled"
+
+say "partitioning $DISK (gpt: 1G esp on /boot, rest ext4 on /)"
+case $DISK in *[0-9]) P=${DISK}p ;; *) P=$DISK ;; esac
+run umount -R "$MNT" 2>/dev/null || true
+run wipefs -af "$DISK"
+run sgdisk --zap-all "$DISK"
+run sgdisk -n1:0:+1G -t1:ef00 -c1:ESP -n2:0:0 -t2:8300 -c2:ghostos "$DISK"
+run partprobe "$DISK" || true
+run udevadm settle || true
+run mkfs.fat -F32 -n ESP "${P}1"
+run mkfs.ext4 -F -L ghostos "${P}2"
+run mount "${P}2" "$MNT"
+run mkdir -p "$MNT/boot"
+run mount "${P}1" "$MNT/boot"
+
+say "installing packages (this takes a while)"
+run pacstrap -K "$MNT" $PAC
+mk_fstab() { genfstab -U "$MNT" > "$MNT/etc/fstab"; }
+run mk_fstab
+run enable_multilib "$MNT/etc/pacman.conf"
+run sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 10/' "$MNT/etc/pacman.conf"
+run sed -i "s/^#\?MAKEFLAGS=.*/MAKEFLAGS=\"-j\$(nproc)\"/" "$MNT/etc/makepkg.conf"
+copy_wifi() {
+	[ -d /var/lib/iwd ] && { mkdir -p "$MNT/var/lib"; cp -a /var/lib/iwd "$MNT/var/lib/"; }
+	return 0
+}
+run copy_wifi
+
+say "configuring"
+ROOTUUID=$(blkid -s UUID -o value "${P}2" 2>/dev/null || echo UNKNOWN)
+AUR=$(section aur | tr '\n' ' ')
+
+cat > "$WORK/chroot.sh" <<EOF
+#!/bin/bash
+set -u
+USER_='$USER_'
+AUR='$AUR'
+GH='$GH'
+
+ln -sf "/usr/share/zoneinfo/$TZ_" /etc/localtime
+hwclock --systohc || true
+sed -i -e 's/^#en_US.UTF-8/en_US.UTF-8/' -e 's/^#uk_UA.UTF-8/uk_UA.UTF-8/' /etc/locale.gen
+locale-gen
+echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+echo 'KEYMAP=us' > /etc/vconsole.conf
+echo '$HOST' > /etc/hostname
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 $HOST\n' > /etc/hosts
+
+useradd -m -G wheel,video,audio,input,seat -s /bin/bash "\$USER_" 2>/dev/null || useradd -m -G wheel,video,audio,input -s /bin/bash "\$USER_"
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-ghostos-install
+chmod 440 /etc/sudoers.d/*
+
+cat > /home/\$USER_/.ghostos-user.sh <<'USEREOF'
+#!/bin/bash
+set -u
+GH=https://github.com/gh0st-8221
+mkdir -p ~/git ~/.config
+for r in arch-dotfiles ghostwm gboot ginit; do git clone --depth 1 "\$GH/\$r" ~/git/\$r; done
+for r in xdg-desktop-portal-termfilechooser-git yay-bin; do git clone --depth 1 https://aur.archlinux.org/\$r.git ~/git/\$r; done
+(cd ~/git/yay-bin && makepkg -si --noconfirm)
+if [ -n "\$AUR" ] && command -v yay >/dev/null; then
+	yay -S --needed --noconfirm \$AUR || echo "some aur packages failed, continuing"
+fi
+(cd ~/git/xdg-desktop-portal-termfilechooser-git && makepkg -si --noconfirm) || echo "termfilechooser failed"
+(cd ~/git/ghostwm && sudo make install) || echo "ghostwm failed"
+(cd ~/git/gboot && make) || echo "gboot build failed, the prebuilt dist/gbootx64.efi is used"
+cp -r ~/git/arch-dotfiles/.config/. ~/.config/
+chmod +x ~/.config/yazi/yazi-wrapper.sh 2>/dev/null
+cp ~/git/arch-dotfiles/.zshrc ~/.zshrc
+{ echo '[ -r /etc/profile.d/ginit.sh ] && . /etc/profile.d/ginit.sh'; cat ~/git/arch-dotfiles/.zprofile; } > ~/.zprofile
+[ -f ~/git/arch-dotfiles/.xinitrc ] && cp ~/git/arch-dotfiles/.xinitrc ~/.xinitrc
+mkdir -p ~/.zsh/plugins
+git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/plugins/zsh-autosuggestions
+git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/plugins/zsh-syntax-highlighting
+USEREOF
+chown "\$USER_:\$USER_" /home/\$USER_/.ghostos-user.sh
+su - "\$USER_" -c "AUR='\$AUR' bash ~/.ghostos-user.sh"
+rm -f /home/\$USER_/.ghostos-user.sh
+
+H=/home/\$USER_
+D=\$H/git/arch-dotfiles
+
+wget -O /usr/bin/xscreencopy "\$GH/xscreencopy/raw/refs/heads/main/xscreencopy" && chmod +x /usr/bin/xscreencopy
+if [ -f \$D/etc/chromium/policies/managed/catppuccin.json ]; then
+	mkdir -p /etc/chromium/policies/managed
+	cp \$D/etc/chromium/policies/managed/catppuccin.json /etc/chromium/policies/managed/catppuccin.json
+	chmod 644 /etc/chromium/policies/managed/catppuccin.json
+fi
+
+chsh -s /usr/bin/zsh "\$USER_"
+chsh -s /usr/bin/zsh root
+mkdir -p /root/.zsh/plugins
+cp -r \$H/.zsh/plugins/zsh-autosuggestions \$H/.zsh/plugins/zsh-syntax-highlighting /root/.zsh/plugins/
+cp \$D/.zshrc /root/.zshrc
+cp \$D/.zprofile /root/.zprofile
+
+mkdir -p /etc/kernel
+echo 'root=UUID=$ROOTUUID rw' > /etc/kernel/cmdline
+touch \$H/.hushlogin
+chown "\$USER_:\$USER_" \$H/.hushlogin
+(cd \$H/git/ginit && SUDO_USER="\$USER_" ./install.sh) || echo "ginit install failed"
+[ -f /etc/mkinitcpio-ginit.conf ] && mkinitcpio -c /etc/mkinitcpio-ginit.conf -g /boot/initramfs-ginit.img
+ginit_img=initramfs-linux.img
+[ -f /boot/initramfs-ginit.img ] && ginit_img=initramfs-ginit.img
+
+mkdir -p /boot/EFI/gboot
+ucode=''
+[ -f /boot/intel-ucode.img ] && ucode="\${ucode}initrd /intel-ucode.img
+"
+[ -f /boot/amd-ucode.img ] && ucode="\${ucode}initrd /amd-ucode.img
+"
+{
+	printf 'timeout 0\ndefault 1\ntitle gboot\n\n'
+	[ -f /boot/EFI/Linux/arch-ginit.efi ] && printf 'entry Arch Linux (ginit)\nefi /EFI/Linux/arch-ginit.efi\n\n'
+	printf 'entry Arch Linux (ginit, plain initramfs)\nkernel /vmlinuz-linux\n%sinitrd /%s\noptions root=UUID=$ROOTUUID rw quiet init=/usr/local/bin/ginit\n\n' "\$ucode" "\$ginit_img"
+	printf 'entry Arch Linux (systemd, rescue)\nkernel /vmlinuz-linux\n%sinitrd /initramfs-linux.img\noptions root=UUID=$ROOTUUID rw\n\n' "\$ucode"
+	[ -f /boot/EFI/Microsoft/Boot/bootmgfw.efi ] && printf 'entry Windows\nefi /EFI/Microsoft/Boot/bootmgfw.efi\n\n'
+	printf 'entry Firmware setup\nfirmware\n\nentry Reboot\nreboot\n\nentry Shutdown\nshutdown\n'
+} > /boot/EFI/gboot/gboot.conf
+efi=\$H/git/gboot/gbootx64.efi
+[ -f "\$efi" ] || efi=\$H/git/gboot/dist/gbootx64.efi
+mkdir -p /boot/EFI/BOOT
+cp "\$efi" /boot/EFI/BOOT/BOOTX64.EFI
+(cd \$H/git/gboot && EFI="\$efi" ./install.sh) || echo "gboot nvram entry failed, fallback path /EFI/BOOT/BOOTX64.EFI is in place"
+num=\$(efibootmgr 2>/dev/null | awk '\$2=="gboot"{print substr(\$1,5,4)}' | head -n1)
+old=\$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: *//p')
+[ -n "\$num" ] && efibootmgr -o "\$num,\$old" >/dev/null 2>&1
+
+mkdir -p /etc/iwd
+printf '[General]\nEnableNetworkConfiguration=false\n' > /etc/iwd/main.conf
+if [ -f /etc/ginit/rc ] && ! grep -q 'lib/iwd/iwd' /etc/ginit/rc; then
+	sed -i '/^NetworkManager\$/d' /etc/ginit/rc
+	cat /root/rc.services >> /etc/ginit/rc
+fi
+sed -i 's/"systemctl poweroff"/"poweroff"/' \$H/.config/ghostwm/config.toml
+rm -f /etc/sudoers.d/99-ghostos-install
+EOF
+
+cat > "$WORK/rc.services" <<'RCEOF'
+
+mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+rfkill unblock all
+systemd-tmpfiles --create --prefix=/var --prefix=/run
+sysctl --system
+for n in /sys/class/net/*; do [ "${n##*/}" = lo ] || ip link set "${n##*/}" up; done
+[ -x /usr/lib/iwd/iwd ] && setsid -f /usr/lib/iwd/iwd
+dhcpcd -b
+setsid -f sh -c 'sleep 15; grep -q ^nameserver /etc/resolv.conf || echo "nameserver 1.1.1.1" > /etc/resolv.conf'
+[ -x /usr/lib/bluetooth/bluetoothd ] && setsid -f /usr/lib/bluetooth/bluetoothd
+if modprobe zram; then
+	z=$(zramctl --find --size "$(awk '/MemTotal/ { print int($2 / 2) "K" }' /proc/meminfo)" --algorithm zstd)
+	[ -n "$z" ] && mkswap "$z" && swapon -p 100 "$z"
+fi
+RCEOF
+run install -m755 "$WORK/chroot.sh" "$MNT/root/ghostos-chroot.sh"
+run install -m644 "$WORK/rc.services" "$MNT/root/rc.services"
+set_passwords() { printf 'root:%s\n%s:%s\n' "$ROOTPW" "$USER_" "$USERPW" | arch-chroot "$MNT" chpasswd; }
+run arch-chroot "$MNT" /bin/bash /root/ghostos-chroot.sh
+run set_passwords
+run rm -f "$MNT/root/ghostos-chroot.sh" "$MNT/root/rc.services"
+fix_resolv() { rm -f "$MNT/etc/resolv.conf"; echo "nameserver 1.1.1.1" > "$MNT/etc/resolv.conf"; }
+run fix_resolv
+
+say "done"
+run umount -R "$MNT"
+echo "remove the installer and reboot. log in on tty1 as $USER_, x starts by itself."

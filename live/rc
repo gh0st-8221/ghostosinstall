@@ -1,0 +1,27 @@
+#!/bin/sh
+exec >/var/log/ginit-rc.log 2>&1
+set -x
+touch /run/ghostos-live
+
+/usr/lib/systemd/systemd-udevd --daemon
+udevadm trigger --action=add --type=subsystems
+udevadm trigger --action=add --type=devices
+udevadm settle -t 10
+ip link set lo up
+mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+rfkill unblock all
+for n in /sys/class/net/*; do [ "${n##*/}" = lo ] || ip link set "${n##*/}" up; done
+systemd-tmpfiles --create --prefix=/var --prefix=/run
+
+mkdir -p /run/dbus
+dbus-uuidgen --ensure
+dbus-daemon --system --fork
+
+[ -x /usr/lib/iwd/iwd ] && setsid -f /usr/lib/iwd/iwd
+dhcpcd -b
+for i in $(seq 1 30); do ip route | grep -q '^default' && break; sleep 1; done
+grep -q '^nameserver' /etc/resolv.conf || echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+
+pacman-key --init
+pacman-key --populate archlinux
+touch /run/ghostos-ready

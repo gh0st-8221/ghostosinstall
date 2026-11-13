@@ -1,0 +1,7 @@
+export PATH=/usr/local/sbin:/usr/local/bin:$PATH
+alias reboot=/usr/local/bin/reboot
+alias poweroff=/usr/local/bin/poweroff
+hash -r
+if [ "$(tty)" = /dev/tty1 ]; then
+    ghostosinstall
+fi
